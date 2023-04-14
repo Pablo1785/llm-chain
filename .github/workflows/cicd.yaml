@@ -35,7 +35,13 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: build
-          args: --all-features
+          args: --all-features --timings
+      
+      - name: Archive build timings
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-timings
+          path: target/cargo-timings/cargo-timing.html
 
       - name: Run tests
         uses: actions-rs/cargo@v1
