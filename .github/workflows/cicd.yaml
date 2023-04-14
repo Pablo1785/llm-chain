@@ -40,8 +40,8 @@ jobs:
       - name: Archive build timings
         uses: actions/upload-artifact@v3
         with:
-          name: build-timings
-          path: target/cargo-timings/cargo-timing-${{ matrix.os }}.html
+          name: build-timings-${{ matrix.os }}
+          path: target/cargo-timings/cargo-timing.html
 
       - name: Run tests
         uses: actions-rs/cargo@v1
