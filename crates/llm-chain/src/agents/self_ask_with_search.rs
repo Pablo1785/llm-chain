@@ -2,7 +2,7 @@ use crate::{
     options::Options,
     parameters,
     prompt::{PromptTemplate, StringTemplateError},
-    tools::{Tool, ToolError},
+    tools::{Tool, ToolError, ToolUseError},
     traits::{Executor, ExecutorError},
     Parameters,
 };
@@ -111,6 +111,8 @@ where
         time_elapsed_seconds: f64,
         iterations_elapsed: u32,
     },
+    #[error(transparent)]
+    ToolUseError(#[from] ToolUseError<T>),
 }
 
 pub struct SelfAskWithSearchAgentOutputParser {
@@ -152,7 +154,7 @@ impl Default for SelfAskWithSearchAgentOutputParser {
 
 #[derive(Debug, Error)]
 #[error("No finish line or follow up question was returned by the model: {0}")]
-pub struct ParserError(String);
+pub struct ParserError(pub String);
 
 impl AgentOutputParser for SelfAskWithSearchAgentOutputParser {
     type Error = ParserError;
