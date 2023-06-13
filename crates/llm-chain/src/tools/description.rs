@@ -2,7 +2,7 @@ use std::{collections::HashMap, marker::PhantomData, any::Any, pin::Pin};
 use erased_serde::Deserializer;
 use async_trait::async_trait;
 use futures::Future;
-use serde::{ser::SerializeMap, Serialize, Serializer, de::DeserializeOwned};
+use serde::{ser::SerializeMap, Serialize, Serializer, de::DeserializeOwned, Deserialize};
 
 /// Represents a single parameter for a tool.
 #[derive(Clone, Debug)]
@@ -97,43 +97,46 @@ impl ToolDescription {
     }
 }
 
+#[derive(Clone, Serialize)]
 pub struct NotFoundError;
 
-pub trait Tool<S> {
-    type Future: Future<Output = serde_yaml::Value>;
-    fn call(&self, input: serde_yaml::Value, state: S) -> Self::Future;
+pub trait ConstDescribe {
+    const FORMAT: Format;
+}
+
+impl ConstDescribe for NotFoundError {
+    const FORMAT: Format = Format { parts: todo!() }; 
+}
+
+impl<T> Describe for T where T: ConstDescribe {
+    fn describe() -> Format {
+        Self::FORMAT
+    }
+}
+
+type YamlResult = Result<serde_yaml::Value, serde_yaml::Error>;
+
+#[async_trait]
+pub trait Tool<T: ?Sized, S> {
+    async fn call(&self, input: &serde_yaml::Value, state: &S) -> YamlResult;
     fn describe_input(&self) -> Format;
     fn describe_output(&self) -> Format;
 }
 
-pub struct DescribedTool<T, S> where T: Tool<S> {
-    tool: Box<T>,
+pub struct DescribedTool<T: ?Sized, S> {
+    tool: Box<dyn Tool<T, S>>,
     name: String,
-    description: String,
-    _marker: PhantomData<S>
+    description: String
 }
-
-impl<T: Tool<S>, S> DescribedTool<T, S> {
-    pub async fn call(&self, name: &str, input: &serde_yaml::Value) -> serde_yaml::Value {
-        todo!()
-    }
-
-    pub fn description(&self) -> ToolDescription {
-        todo!()
-    }
-}
-
-type BoxedFuture = Box<dyn Future<Output = serde_yaml::Value>>;
-type BoxedTool<S> = Box<dyn Tool<S, Future = BoxedFuture>>;
 
 pub struct Toolbox<S> {
-    tools: HashMap<String, BoxedTool<S>>,
+    tools: HashMap<String, DescribedTool<dyn Any, S>>,
     state: S,
 }
 
 impl<S> Toolbox<S> {
-    pub fn add_tool<T: Tool<S, Future = BoxedFuture>>(&mut self, name: &str, description: &str, tool: T) -> Option<BoxedTool<S>> {
-        self.tools.insert(name.into(), Box::new(tool))
+    pub fn add_tool(&mut self, name: &str, description: &str, tool: impl Tool<dyn Any, S> + 'static) -> Option<DescribedTool<dyn Any, S>> {
+        self.tools.insert(name.into(), DescribedTool { tool: Box::new(tool), name: name.into(), description: description.into() })
     }
 
     pub fn describe_all_tools(&self) -> Result<serde_yaml::Value, serde_yaml::Error> {
@@ -145,112 +148,141 @@ impl<S> Toolbox<S> {
     }
 }
 
-impl<F, Fut, Res, S> Tool<S> for F
-where
-    F: FnOnce() -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Res> + Send,
-    Res: Serialize + Describe,
-    S: Clone
-{
-    type Future = Pin<Box<dyn Future<Output = serde_yaml::Value> + Send>>;
+pub trait FromState<S> {
+    fn from_state(state: S) -> Self;
+}
 
-    fn call(&self, _req: serde_yaml::Value, _state: S) -> Self::Future {
-        Box::pin(async move { serde_yaml::to_value(self().await) })
+
+#[async_trait]
+impl<F, Fut, Res, S> Tool<(), S> for F
+where
+    F: FnOnce() -> Fut + Clone + Send + Sync,
+    Fut: Future<Output = Res> + Send,
+    Res: Serialize + ConstDescribe,
+    S: Clone + Send
+{
+    async fn call(&self, _req: &serde_yaml::Value, _state: &S) -> YamlResult {
+        serde_yaml::to_value(self.clone()().await)
+    }
+    fn describe_input(&self) -> Format {
+        Format { parts: vec![] }
+    }
+
+    fn describe_output(&self) -> Format {
+        Res::FORMAT
     }
 }
 
 
 
-// macro_rules! impl_from_request {
-//     (
-//         [$($ty:ident),*], $last:ident
-//     ) => {
+macro_rules! impl_from_state {
+    (
+        [$($ty:ident),*], $last:ident
+    ) => {
 
-//         // This impl must not be generic over M, otherwise it would conflict with the blanket
-//         // implementation of `FromRequest<S, Mut>` for `T: FromRequestParts<S>`.
-//         #[async_trait]
-//         #[allow(non_snake_case, unused_mut, unused_variables)]
-//         impl<S, $($ty,)* $last> FromRequest<S> for ($($ty,)* $last,)
-//         where
-//             $( $ty: FromRequest<S> + Send, )*
-//             $last: FromRequest<S> + Send,
-//             S: Send + Sync,
-//         {
-//             type Rejection = Response;
+        // This impl must not be generic over M, otherwise it would conflict with the blanket
+        // implementation of `FromRequest<S, Mut>` for `T: FromRequestParts<S>`.
+        impl<S, $($ty,)* $last> FromState<S> for ($($ty,)* $last,)
+        where
+            $( $ty: FromState<S> + Send, )*
+            $last: FromState<S> + Send,
+            S: Clone + Send + Sync,
+        {
+            fn from_state(state: S) -> Self {
+                $(
+                    let $ty = $ty::from_state(state.clone());
+                )*
 
-//             async fn from_request(req: &serde_yaml::Value, state: &S) -> Result<Self, Self::Rejection> {
-//                 $(
-//                     let $ty = $ty::from_request(req, state).await.map_err(|rejection| rejection.into_response())?;
-//                 )*
+                let $last = $last::from_state(state.clone());
 
-//                 let $last = $last::from_request(&req, state).await.map_err(|rejection| rejection.into_response())?;
+                ($($ty,)* $last,)
+            }
+        }
+    };
+}
+macro_rules! impl_handler {
+    (
+        [$($ty:ident),*], $last:ident
+    ) => {
+        #[async_trait]
+        impl<F, Fut, S, Res, $($ty,)* $last> Tool<($($ty,)* $last,), S> for F
+        where
+            F: FnOnce( $($ty,)* $last, ) -> Fut + Clone + Send + Sync,
+            Fut: Future<Output = Res> + Send,
+            Res: Serialize + ConstDescribe,
+            S: Clone + Send + Sync,
+            $( $ty: FromState<S> + Send + Sync, )*
+            $last: DeserializeOwned + Send + ConstDescribe,
+        {
 
-//                 Ok(($($ty,)* $last,))
-//             }
-//         }
-//     };
-// }
-// macro_rules! impl_handler {
-//     (
-//         [$($ty:ident),*], $last:ident
-//     ) => {
-//         #[allow(non_snake_case, unused_mut)]
-//         impl<F, Fut, S, M, $($ty,)* $last> Handler<(M, $($ty,)* $last,), S> for F
-//         where
-//             F: FnOnce($($ty,)* $last,) -> Fut + Clone + Send,
-//             Fut: Future<Output = Response> + Send,
-//             S: Clone + Send + Sync + 'static,
-//             $( $ty: FromRequest<S, M> + Send, )*
-//             $last: FromRequest<S, M> + Send,
-//         {
-//             type Future = Pin<Box<dyn Future<Output = Response> + Send>>;
+            async fn call(&self, input: &serde_yaml::Value, state: &S) -> YamlResult {
+                    $(
+                        let $ty = $ty::from_state(state.clone());
+                    )*
 
-//             fn call(self, req: serde_yaml::Value, state: S) -> Self::Future {
-//                 Box::pin(async move {
-//                     let state = &state;
+                    let $last = serde_yaml::from_value(input.clone())?;
 
-//                     $(
-//                         let $ty = match $ty::from_request(&req, state).await {
-//                             Ok(value) => value,
-//                             Err(rejection) => return rejection.into_response(),
-//                         };
-//                     )*
+                    let res = self.clone()($($ty,)* $last,).await;
 
-//                     let $last = match $last::from_request(&req, state).await {
-//                         Ok(value) => value,
-//                         Err(rejection) => return rejection.into_response(),
-//                     };
+                    serde_yaml::to_value(res)
+            }
+            fn describe_input(&self) -> Format {
+                $last::FORMAT
+            }
 
-//                     let res = self($($ty,)* $last,).await;
+            fn describe_output(&self) -> Format {
+                Res::FORMAT
+            }
+        }
+    };
+}
 
-//                     res.into_response()
-//                 })
-//             }
-//         }
-//     };
-// }
+#[rustfmt::skip]
+macro_rules! all_the_tuples {
+    ($name:ident) => {
+        $name!([], T1);
+        $name!([T1], T2);
+        $name!([T1, T2], T3);
+        $name!([T1, T2, T3], T4);
+        $name!([T1, T2, T3, T4], T5);
+        $name!([T1, T2, T3, T4, T5], T6);
+        $name!([T1, T2, T3, T4, T5, T6], T7);
+        $name!([T1, T2, T3, T4, T5, T6, T7], T8);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8], T9);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9], T10);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], T11);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11], T12);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12], T13);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13], T14);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14], T15);
+        $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15], T16);
+    };
+}
 
-// #[rustfmt::skip]
-// macro_rules! all_the_tuples {
-//     ($name:ident) => {
-//         $name!([], T1);
-//         $name!([T1], T2);
-//         $name!([T1, T2], T3);
-//         $name!([T1, T2, T3], T4);
-//         $name!([T1, T2, T3, T4], T5);
-//         $name!([T1, T2, T3, T4, T5], T6);
-//         $name!([T1, T2, T3, T4, T5, T6], T7);
-//         $name!([T1, T2, T3, T4, T5, T6, T7], T8);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8], T9);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9], T10);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10], T11);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11], T12);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12], T13);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13], T14);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14], T15);
-//         $name!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15], T16);
-//     };
-// }
+all_the_tuples!(impl_from_state);
+all_the_tuples!(impl_handler);
 
-// all_the_tuples!(impl_from_request);
-// all_the_tuples!(impl_handler);
+
+async fn my_tool() -> NotFoundError {
+    NotFoundError
+}
+
+#[derive(Deserialize)]
+struct ToolInput { 
+    pub text: String
+}
+
+impl ConstDescribe for ToolInput {
+    const FORMAT: Format = Format { parts: vec![FormatPart { key: "text".to_string(), purpose: "Text of the input".to_string() }]};
+}
+
+async fn my_input_tool(ToolInput {text }: ToolInput) -> NotFoundError {
+    NotFoundError
+}
+
+fn do_smth() {
+    let tool = Box::new(my_tool) as Box<dyn Tool<(), usize>>;
+    tool.describe_input();
+
+    let tool2 = Box::new(my_input_tool) as Box<dyn Tool<(ToolInput,), usize>>;
+}
