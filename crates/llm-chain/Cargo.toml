@@ -31,6 +31,7 @@ tokio-stream = "0.1.14"
 strum = "0.25.0"
 strum_macros = "0.24.3"
 paste = "1.0.12"
+erased-serde = "0.3.25"
 
 [dev-dependencies]
 mockall = "0.11.4"
