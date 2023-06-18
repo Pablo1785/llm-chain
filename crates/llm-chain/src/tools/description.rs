@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData, any::Any, pin::Pin};
+use std::{collections::HashMap, marker::PhantomData, any::Any, pin::Pin, convert::Infallible};
 use erased_serde::Deserializer;
 use async_trait::async_trait;
 use futures::Future;
@@ -96,147 +96,193 @@ impl ToolDescription {
         }
     }
 }
+pub struct Yaml<T: DeserializeOwned + Send>(pub T);
 
-#[derive(Clone, Serialize)]
-pub struct NotFoundError;
+pub struct State<T>(pub T);
 
-pub trait ConstDescribe {
-    const FORMAT: Format;
-}
-
-impl ConstDescribe for NotFoundError {
-    const FORMAT: Format = Format { parts: todo!() }; 
-}
-
-impl<T> Describe for T where T: ConstDescribe {
-    fn describe() -> Format {
-        Self::FORMAT
+impl<S> FromContext<S> for State<S> {
+    type Error = Infallible;
+    fn from_context(_message: &str, state: S) -> Result<Self, Self::Error> {
+        Ok(State(state))
     }
 }
 
-type YamlResult = Result<serde_yaml::Value, serde_yaml::Error>;
-
-#[async_trait]
-pub trait Tool<T: ?Sized, S> {
-    async fn call(&self, input: &serde_yaml::Value, state: &S) -> YamlResult;
-    fn describe_input(&self) -> Format;
-    fn describe_output(&self) -> Format;
-}
-
-pub struct DescribedTool<T: ?Sized, S> {
-    tool: Box<dyn Tool<T, S>>,
-    name: String,
-    description: String
-}
-
-pub struct Toolbox<S> {
-    tools: HashMap<String, DescribedTool<dyn Any, S>>,
-    state: S,
-}
-
-impl<S> Toolbox<S> {
-    pub fn add_tool(&mut self, name: &str, description: &str, tool: impl Tool<dyn Any, S> + 'static) -> Option<DescribedTool<dyn Any, S>> {
-        self.tools.insert(name.into(), DescribedTool { tool: Box::new(tool), name: name.into(), description: description.into() })
-    }
-
-    pub fn describe_all_tools(&self) -> Result<serde_yaml::Value, serde_yaml::Error> {
-        todo!()
-    }
-
-    pub async fn call_tool(&self, name: &str, input: &serde_yaml::Value) -> Result<serde_yaml::Value, NotFoundError> {
-        todo!()
-    }
-}
-
-pub trait FromState<S> {
-    fn from_state(state: S) -> Self;
-}
-
-
-#[async_trait]
-impl<F, Fut, Res, S> Tool<(), S> for F
+impl<T> Describe for Yaml<T>
 where
-    F: FnOnce() -> Fut + Clone + Send + Sync,
-    Fut: Future<Output = Res> + Send,
-    Res: Serialize + ConstDescribe,
-    S: Clone + Send
+    T: Describe + DeserializeOwned + Send,
 {
-    async fn call(&self, _req: &serde_yaml::Value, _state: &S) -> YamlResult {
-        serde_yaml::to_value(self.clone()().await)
-    }
-    fn describe_input(&self) -> Format {
-        Format { parts: vec![] }
-    }
+   fn describe() -> Format {
+    T::describe()
+   } 
+}
 
-    fn describe_output(&self) -> Format {
-        Res::FORMAT
+impl<T: DeserializeOwned + Send + ToString> ToString for Yaml<T> {
+    fn to_string(&self) -> String {
+        self.0.to_string()
     }
 }
 
+pub trait FromContext<S>: Sized {
+    type Error: ToString;
+    fn from_context(message: &str, state: S) -> Result<Self, Self::Error>;
+}
 
+impl<S, T: DeserializeOwned + Send> FromContext<S> for Yaml<T> {
+    type Error = serde_yaml::Error;
+    fn from_context(message: &str, _state: S) -> Result<Self, Self::Error> {
+        Ok(Yaml(serde_yaml::from_str(&message)?))
+    }
+}
 
-macro_rules! impl_from_state {
+pub trait Handler<T, S>: Send + Sync + Sized + 'static {
+    type Future: Future<Output = String> + Send;
+    fn call(self, message: String, state: S) -> Self::Future;
+    fn with_state(self, state: S) -> HandlerService<Self, T, S>;
+}
+
+impl<F, S, Fut, Res> Handler<(), S> for F
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Res> + Send,
+    Res: ToString + Describe,
+{
+    type Future = Pin<Box<dyn Future<Output = String> + Send>>;
+    fn call(self, _context: String, _state: S) -> Self::Future {
+        Box::pin(async move { (self)().await.to_string() })
+    }
+
+    fn with_state(self, state: S) -> HandlerService<Self, (), S> {
+        HandlerService::new(self, state, Format { parts: vec![] }, Res::describe())
+    }
+}
+
+macro_rules! impl_from_context {
     (
         [$($ty:ident),*], $last:ident
     ) => {
-
-        // This impl must not be generic over M, otherwise it would conflict with the blanket
-        // implementation of `FromRequest<S, Mut>` for `T: FromRequestParts<S>`.
-        impl<S, $($ty,)* $last> FromState<S> for ($($ty,)* $last,)
+        #[allow(non_snake_case)]
+        impl<S, $($ty,)* $last> FromContext<S> for ($($ty,)* $last,)
         where
-            $( $ty: FromState<S> + Send, )*
-            $last: FromState<S> + Send,
+            $( $ty: FromContext<S> + Send, )*
+            $last: FromContext<S> + Send,
             S: Clone + Send + Sync,
         {
-            fn from_state(state: S) -> Self {
+            type Error = String;
+            fn from_context(req: &str, state: S) -> Result<Self, Self::Error> {
                 $(
-                    let $ty = $ty::from_state(state.clone());
+                    let $ty = $ty::from_context(req, state.clone()).map_err(|e| e.to_string())?;
                 )*
 
-                let $last = $last::from_state(state.clone());
+                let $last = $last::from_context(req, state).map_err(|e| e.to_string())?;
 
-                ($($ty,)* $last,)
+                Ok(($($ty,)* $last,))
             }
         }
     };
 }
+
 macro_rules! impl_handler {
     (
         [$($ty:ident),*], $last:ident
     ) => {
-        #[async_trait]
-        impl<F, Fut, S, Res, $($ty,)* $last> Tool<($($ty,)* $last,), S> for F
+        #[allow(non_snake_case, unused_mut)]
+        impl<F, S, Fut, Res, $($ty,)* $last> Handler<($($ty,)* $last,), S> for F
         where
-            F: FnOnce( $($ty,)* $last, ) -> Fut + Clone + Send + Sync,
+            F: FnOnce($($ty,)* $last,) -> Fut + Send + Sync + 'static,
             Fut: Future<Output = Res> + Send,
-            Res: Serialize + ConstDescribe,
-            S: Clone + Send + Sync,
-            $( $ty: FromState<S> + Send + Sync, )*
-            $last: DeserializeOwned + Send + ConstDescribe,
+            Res: ToString + Describe,
+            S: Clone + Send + Sync + 'static,
+            $( $ty: FromContext<S> + Send, )*
+            $last: FromContext<S> + Send + Describe,
         {
+            type Future = Pin<Box<dyn Future<Output = String> + Send>>;
 
-            async fn call(&self, input: &serde_yaml::Value, state: &S) -> YamlResult {
-                    $(
-                        let $ty = $ty::from_state(state.clone());
-                    )*
+            fn call(self, req: String, state: S) -> Self::Future {
+                Box::pin(async move {
+                $(
+                    let $ty = match $ty::from_context(&req, state.clone()) {
+                        Ok(val) => val,
+                        Err(err) => return err.to_string(),
+                    };
+                )*
 
-                    let $last = serde_yaml::from_value(input.clone())?;
+                let $last = match $last::from_context(&req, state) {
+                    Ok(val) => val,
+                    Err(err) => return err.to_string(),
+                };
 
-                    let res = self.clone()($($ty,)* $last,).await;
-
-                    serde_yaml::to_value(res)
+                self($($ty,)* $last,).await.to_string()
+            })
             }
-            fn describe_input(&self) -> Format {
-                $last::FORMAT
-            }
 
-            fn describe_output(&self) -> Format {
-                Res::FORMAT
+            fn with_state(self, state: S) -> HandlerService<Self, ($($ty,)* $last,), S> {
+                HandlerService::new(self, state, $last::describe(), Res::describe())
             }
         }
     };
 }
 
+macro_rules! impl_pipe {
+    (
+        [$($ty:ident),*], $last:ident
+    ) => {
+        impl<$($ty,)* F1, O1, Fut1> Pipe<($($ty,)*), O1> for F1
+        where
+            F1: FnOnce($($ty,)*) -> Fut1 + Sized,
+            Fut1: Future<Output = O1>,
+        {
+            fn pipe<O2: ToString + Describe, Fut2: Future<Output = O2>, F2: FnOnce(O1) -> Fut2>(
+                self,
+                f: F2,
+            ) -> PipedFn<Self, F2> {
+                PipedFn { fn1: self, fn2: f }
+            }
+        }
+    }
+}
+
+macro_rules! impl_pipe_handler {
+    (
+        [$($ty:ident),*], $last:ident
+    ) => {
+        #[allow(non_snake_case)]
+        impl<$($ty,)* $last, S, F1, F2, Fut1, Res1, Fut2, Res2> Handler<($($ty,)* $last,), S> for PipedFn<F1, F2>
+        where
+            F1: FnOnce($($ty,)* $last) -> Fut1 + Send + Sync + 'static,
+            F2: FnOnce(Res1) -> Fut2 + Send + Sync + 'static,
+            $( $ty: FromContext<S> + Send, )*
+            $last: FromContext<S> + Send + Describe,
+            Fut1: Future<Output = Res1> + Send,
+            Fut2: Future<Output = Res2> + Send,
+            Res1: Send,
+            Res2: ToString + Describe,
+            S: Clone + Send + 'static,
+        {
+            type Future = Pin<Box<dyn Future<Output = String> + Send>>;
+
+            fn call(self, message: String, state: S) -> Self::Future {
+                Box::pin(async move {
+                    $(
+                        let $ty = match $ty::from_context(&message, state.clone()) {
+                            Ok(val) => val,
+                            Err(err) => return err.to_string(),
+                        };
+                    )*
+                    let $last = match $last::from_context(&message, state) {
+                        Ok(val) => val,
+                        Err(err) => return err.to_string(),
+                    };
+                    let res1 = (self.fn1)($($ty,)* $last).await;
+                    (self.fn2)(res1).await.to_string()
+                })
+            }
+
+            fn with_state(self, state: S) -> HandlerService<Self, ($($ty,)* $last,), S> {
+                HandlerService::new(self, state, $last::describe(), Res2::describe())
+            }
+        }
+    };
+}
 #[rustfmt::skip]
 macro_rules! all_the_tuples {
     ($name:ident) => {
@@ -259,30 +305,93 @@ macro_rules! all_the_tuples {
     };
 }
 
-all_the_tuples!(impl_from_state);
+all_the_tuples!(impl_from_context);
 all_the_tuples!(impl_handler);
+all_the_tuples!(impl_pipe);
+all_the_tuples!(impl_pipe_handler);
 
-
-async fn my_tool() -> NotFoundError {
-    NotFoundError
+/// TOOL OUTPUT HANDLING
+pub trait Pipe<T, O1>: Sized {
+    fn pipe<O2: ToString + Describe, Fut2: Future<Output = O2>, F: FnOnce(O1) -> Fut2>(
+        self,
+        f: F,
+    ) -> PipedFn<Self, F>;
 }
 
-#[derive(Deserialize)]
-struct ToolInput { 
-    pub text: String
+#[derive(Clone)]
+pub struct PipedFn<F1, F2> {
+    fn1: F1,
+    fn2: F2,
 }
 
-impl ConstDescribe for ToolInput {
-    const FORMAT: Format = Format { parts: vec![FormatPart { key: "text".to_string(), purpose: "Text of the input".to_string() }]};
+impl<T, S, F1, F2, Fut1, Res1, Fut2, Res2> Handler<T, S> for PipedFn<F1, F2>
+where
+    F1: FnOnce(T) -> Fut1 + Send + Sync + 'static,
+    F2: FnOnce(Res1) -> Fut2 + Send + Sync + 'static,
+    T: FromContext<S> + Send + Describe,
+    Fut1: Future<Output = Res1> + Send,
+    Fut2: Future<Output = Res2> + Send,
+    Res1: Send,
+    Res2: ToString + Describe,
+    S: Send + 'static,
+{
+    type Future = Pin<Box<dyn Future<Output = String> + Send>>;
+
+    fn call(self, message: String, state: S) -> Self::Future {
+        Box::pin(async move {
+            let t = match T::from_context(&message, state) {
+                Ok(val) => val,
+                Err(err) => return err.to_string(),
+            };
+            let res1 = (self.fn1)(t).await;
+            (self.fn2)(res1).await.to_string()
+        })
+    }
+
+    fn with_state(self, state: S) -> HandlerService<Self, T, S> {
+        HandlerService::new(self, state, T::describe(), Res2::describe())
+    }
 }
 
-async fn my_input_tool(ToolInput {text }: ToolInput) -> NotFoundError {
-    NotFoundError
+/// ROUTING
+pub struct HandlerService<H, T, S> {
+    handler: H,
+    state: S,
+    input_description: Format,
+    output_description: Format,
+    _marker: PhantomData<fn() -> T>,
 }
 
-fn do_smth() {
-    let tool = Box::new(my_tool) as Box<dyn Tool<(), usize>>;
-    tool.describe_input();
+impl<H, T, S> HandlerService<H, T, S> {
+    pub fn new(
+        handler: H,
+        state: S,
+        input_description: Format,
+        output_description: Format,
+    ) -> Self {
+        Self {
+            handler,
+            state,
+            input_description,
+            output_description,
+            _marker: Default::default(),
+        }
+    }
+}
 
-    let tool2 = Box::new(my_input_tool) as Box<dyn Tool<(ToolInput,), usize>>;
+#[async_trait]
+pub trait Tool {
+    async fn call(&self, message: String) -> String;
+}
+
+#[async_trait]
+impl<H, T, S> Tool for HandlerService<H, T, S>
+where
+    H: Handler<T, S> + Clone,
+    S: Clone + Send + Sync,
+{
+    async fn call(&self, message: String) -> String {
+        let handler = self.handler.clone();
+        handler.call(message, self.state.clone()).await.to_string()
+    }
 }

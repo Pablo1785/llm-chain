@@ -25,9 +25,12 @@ tiktoken-rs = { version = "0.4.2", features = ["async-openai"] }
 tokio = "1.28.2"
 
 [dev-dependencies]
-tokio = "1.28.2"
+tokio = { version = "1.28.2", features = ["full"] }
 qdrant-client = "1.2.0"
 llm-chain = { path = "../llm-chain" }
+llm-chain-openai = { path = "../llm-chain-openai" }
+llm-chain-hnsw = { path = "../llm-chain-hnsw" }
+llm-chain-macros = { path = "../llm-chain-macros" }
 anyhow = "1.0.70"
 serde_yaml = "0.9.21"
 
