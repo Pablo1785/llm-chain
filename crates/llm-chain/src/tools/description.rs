@@ -1,8 +1,11 @@
-use std::{collections::HashMap, marker::PhantomData, any::Any, pin::Pin, convert::Infallible};
-use erased_serde::Deserializer;
 use async_trait::async_trait;
+use erased_serde::Deserializer;
 use futures::Future;
-use serde::{ser::SerializeMap, Serialize, Serializer, de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, ser::SerializeMap, Deserialize, Serialize, Serializer};
+use std::{
+    any::Any, collections::HashMap, convert::Infallible, error::Error, marker::PhantomData,
+    pin::Pin,
+};
 
 /// Represents a single parameter for a tool.
 #[derive(Clone, Debug)]
@@ -65,6 +68,7 @@ pub trait Describe {
     fn describe() -> Format;
 }
 
+
 /// Represents the description of a tool, including its name, usage, and input/output formats.
 #[derive(Serialize, Debug)]
 pub struct ToolDescription {
@@ -111,9 +115,9 @@ impl<T> Describe for Yaml<T>
 where
     T: Describe + DeserializeOwned + Send,
 {
-   fn describe() -> Format {
-    T::describe()
-   } 
+    fn describe() -> Format {
+        T::describe()
+    }
 }
 
 impl<T: DeserializeOwned + Send + ToString> ToString for Yaml<T> {
@@ -135,7 +139,9 @@ impl<S, T: DeserializeOwned + Send> FromContext<S> for Yaml<T> {
 }
 
 pub trait Handler<T, S>: Send + Sync + Sized + 'static {
-    type Future: Future<Output = String> + Send;
+    type Output: ToString;
+    type Error: Error;
+    type Future: Future<Output = Result<Self::Output, Self::Error>> + Send;
     fn call(self, message: String, state: S) -> Self::Future;
     fn with_state(self, state: S) -> HandlerService<Self, T, S>;
 }
@@ -146,9 +152,11 @@ where
     Fut: Future<Output = Res> + Send,
     Res: ToString + Describe,
 {
-    type Future = Pin<Box<dyn Future<Output = String> + Send>>;
+    type Output = String;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
     fn call(self, _context: String, _state: S) -> Self::Future {
-        Box::pin(async move { (self)().await.to_string() })
+        Box::pin(async move { Ok((self)().await.to_string()) })
     }
 
     fn with_state(self, state: S) -> HandlerService<Self, (), S> {
@@ -186,32 +194,38 @@ macro_rules! impl_handler {
         [$($ty:ident),*], $last:ident
     ) => {
         #[allow(non_snake_case, unused_mut)]
-        impl<F, S, Fut, Res, $($ty,)* $last> Handler<($($ty,)* $last,), S> for F
+        impl<F, S, Fut, Res, Err, $($ty,)* $last> Handler<($($ty,)* $last,), S> for F
         where
             F: FnOnce($($ty,)* $last,) -> Fut + Send + Sync + 'static,
-            Fut: Future<Output = Res> + Send,
+            Fut: Future<Output = Result<Res, Err>> + Send,
             Res: ToString + Describe,
+            Err: Error,
             S: Clone + Send + Sync + 'static,
             $( $ty: FromContext<S> + Send, )*
             $last: FromContext<S> + Send + Describe,
         {
-            type Future = Pin<Box<dyn Future<Output = String> + Send>>;
+            type Output = String;
+            type Error = Err;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
             fn call(self, req: String, state: S) -> Self::Future {
                 Box::pin(async move {
                 $(
                     let $ty = match $ty::from_context(&req, state.clone()) {
                         Ok(val) => val,
-                        Err(err) => return err.to_string(),
+                        Err(err) => return Ok(err.to_string()),
                     };
                 )*
 
                 let $last = match $last::from_context(&req, state) {
                     Ok(val) => val,
-                    Err(err) => return err.to_string(),
+                    Err(err) => return Ok(err.to_string()),
                 };
 
-                self($($ty,)* $last,).await.to_string()
+                match self($($ty,)* $last,).await {
+                    Ok(val) => Ok(val.to_string()),
+                    Err(err) => Err(err)
+                }
             })
             }
 
@@ -258,22 +272,24 @@ macro_rules! impl_pipe_handler {
             Res2: ToString + Describe,
             S: Clone + Send + 'static,
         {
-            type Future = Pin<Box<dyn Future<Output = String> + Send>>;
+            type Output = String;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
             fn call(self, message: String, state: S) -> Self::Future {
                 Box::pin(async move {
                     $(
                         let $ty = match $ty::from_context(&message, state.clone()) {
                             Ok(val) => val,
-                            Err(err) => return err.to_string(),
+                            Err(err) => return Ok(err.to_string()),
                         };
                     )*
                     let $last = match $last::from_context(&message, state) {
                         Ok(val) => val,
-                        Err(err) => return err.to_string(),
+                        Err(err) => return Ok(err.to_string()),
                     };
                     let res1 = (self.fn1)($($ty,)* $last).await;
-                    (self.fn2)(res1).await.to_string()
+                    Ok((self.fn2)(res1).await.to_string())
                 })
             }
 
@@ -335,16 +351,18 @@ where
     Res2: ToString + Describe,
     S: Send + 'static,
 {
-    type Future = Pin<Box<dyn Future<Output = String> + Send>>;
+    type Output = String;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
 
     fn call(self, message: String, state: S) -> Self::Future {
         Box::pin(async move {
             let t = match T::from_context(&message, state) {
                 Ok(val) => val,
-                Err(err) => return err.to_string(),
+                Err(err) => return Ok(err.to_string()),
             };
             let res1 = (self.fn1)(t).await;
-            (self.fn2)(res1).await.to_string()
+            Ok((self.fn2)(res1).await.to_string())
         })
     }
 
@@ -357,6 +375,8 @@ where
 pub struct HandlerService<H, T, S> {
     handler: H,
     state: S,
+    name: String,
+    usage_description: String,
     input_description: Format,
     output_description: Format,
     _marker: PhantomData<fn() -> T>,
@@ -375,23 +395,44 @@ impl<H, T, S> HandlerService<H, T, S> {
             input_description,
             output_description,
             _marker: Default::default(),
+            name: todo!(),
+            usage_description: todo!(),
         }
     }
 }
 
 #[async_trait]
 pub trait Tool {
-    async fn call(&self, message: String) -> String;
+    type Error: Error;
+    async fn call(&self, message: String) -> Result<String, Self::Error>;
 }
 
 #[async_trait]
 impl<H, T, S> Tool for HandlerService<H, T, S>
 where
-    H: Handler<T, S> + Clone,
+    H: Handler<T, S, Error = Infallible> + Clone,
     S: Clone + Send + Sync,
 {
-    async fn call(&self, message: String) -> String {
+    type Error = Infallible;
+    async fn call(&self, message: String) -> Result<String, Self::Error> {
         let handler = self.handler.clone();
-        handler.call(message, self.state.clone()).await.to_string()
+        match handler.call(message, self.state.clone()).await {
+            Ok(val) => Ok(val.to_string()),
+            Err(e) => Ok(e.to_string()),
+        }
+    }
+}
+
+pub struct Toolbox<E: Error> {
+    tools: HashMap<String, Box<dyn Tool<Error = E>>>,
+    _marker: PhantomData<E>,
+}
+
+impl<E: Error> Toolbox<E> {
+    fn add_tool<T>(&mut self, tool: T)
+    where
+        T: Tool<Error = E>,
+    {
+        self.tools.insert(todo!(), Box::new(tool));
     }
 }

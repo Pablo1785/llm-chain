@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap, convert::Infallible, future::Future, marker::PhantomData, pin::Pin, sync::{Arc},
+    collections::HashMap, convert::Infallible, future::Future, marker::PhantomData, pin::Pin, sync::{Arc}, error::Error,
 };
 
 use async_trait::async_trait;
 use llm_chain::{
-    document_stores::in_memory_document_store::InMemoryDocumentStore, traits::VectorStore, schema::{EmptyMetadata, Document}, tools::{Format, Describe, FormatPart, Yaml, State, Tool, Handler, Pipe},
+    document_stores::in_memory_document_store::InMemoryDocumentStore, traits::VectorStore, schema::{EmptyMetadata, Document}, tools::{Format, Describe, FormatPart, Yaml, State, Tool, Handler, Pipe, ToolUseError},
 };
 
 use llm_chain_hnsw::{HnswVectorStore, HnswArgs};
@@ -36,7 +36,7 @@ impl ToString for MyStruct {
 async fn print_yaml(
     State(MyComplicatedState { num, .. }): State<MyComplicatedState>,
     Yaml(MyStruct { id, name }): Yaml<MyStruct>,
-) -> Yaml<MyStruct> {
+) -> Result<Yaml<MyStruct>, Infallible> {
     let text: String = MyStruct::describe()
         .parts
         .iter()
@@ -44,7 +44,7 @@ async fn print_yaml(
         .collect();
     println!("FORMAT: {text}");
     println!("State: {num}");
-    Yaml(MyStruct { id, name })
+    Ok(Yaml(MyStruct { id, name }))
 }
 
 /// SIMPLE EXAMPLE OF A TOOL
@@ -56,11 +56,12 @@ struct MyTool {
 
 #[async_trait]
 impl Tool for MyTool {
-    async fn call(&self, message: String) -> String {
-        format!(
+    type Error = Infallible;
+    async fn call(&self, message: String) -> Result<String, Self::Error> {
+        Ok(format!(
             "Hello from my tool, LLM! You've asked me to {}. I've got {}, {}, and {:?}",
             message, self.id, self.name, self.data
-        )
+        ))
     }
 }
 
@@ -193,27 +194,32 @@ pub async fn main() {
         hnsw_vector_store: hnsw_vs,
     };
 
-    let mut handlers: HashMap<String, Box<dyn Tool>> = HashMap::new();
+    let mut handlers: HashMap<String, Box<dyn Tool<Error = ToolUseError>>> = HashMap::new();
 
-    handlers.insert("yaml".to_string(), Box::new(print_yaml.with_state(my_complicated_state.clone())));
-    handlers.insert(
-        "pipe".to_string(),
-        Box::new(failable_tool.pipe(my_error_handler).with_state(my_complicated_state.clone())),
-    );
-    handlers.insert(
-        "similarity".to_string(),
-        Box::new(vectorstore_tool.with_state(my_complicated_state.clone())),
-    );
-    handlers.insert("Other state".to_string(), Box::new(tool_that_uses_different_state.with_state(12.5)));
+    handlers.insert("yaml".to_string(), Box::new(print_yaml.pipe(|r| async {
+        match r {
+    Ok(val) => Ok(val),
+    Err(err) => Err(ToolUseError::from(Box::new(err) as Box<dyn Error>)),
+}
+    }).with_state(my_complicated_state.clone())));
+    // handlers.insert(
+    //     "pipe".to_string(),
+    //     Box::new(failable_tool.pipe(my_error_handler).with_state(my_complicated_state.clone())),
+    // );
+    // handlers.insert(
+    //     "similarity".to_string(),
+    //     Box::new(vectorstore_tool.with_state(my_complicated_state.clone())),
+    // );
+    // handlers.insert("Other state".to_string(), Box::new(tool_that_uses_different_state.with_state(12.5)));
 
     let res = handlers.get("pipe").unwrap().call(message.clone()).await;
-    println!("Pipe response: {res}");
+    println!("Pipe response: {res:?}");
 
     let res = handlers.get("yaml").unwrap().call(message).await;
-    println!("Yaml response: {res}");
+    println!("Yaml response: {res:?}");
 
     let res = handlers.get("similarity").unwrap().call("
             query: Some controversial topic
     ".to_string()).await;
-    println!("Similarity response: {res}");
+    println!("Similarity response: {res:?}");
 }
