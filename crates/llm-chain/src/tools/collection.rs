@@ -1,3 +1,5 @@
+use std::error::Error;
+
 use super::tool::{Tool, ToolError};
 use crate::parsing::{find_yaml, ExtractionError};
 use crate::prompt::StringTemplate;
@@ -10,7 +12,7 @@ pub struct ToolCollection<T> {
 }
 
 #[derive(Error, Debug)]
-pub enum ToolUseError<E: ToolError> {
+pub enum ToolUseError<'a> {
     #[error("Model is not trying to invoke tools")]
     NoToolInvocation,
     #[error("You must output at most one tool invocation")]
@@ -24,7 +26,7 @@ pub enum ToolUseError<E: ToolError> {
     #[error("Tool invocation failed: {0}")]
     ToolInvocationFailed(String),
     #[error(transparent)]
-    ToolError(#[from] E),
+    ToolError(#[from] Box<dyn Error + 'a>),
 }
 
 impl<T> ToolCollection<T>
@@ -43,19 +45,22 @@ where
         &self,
         name: &str,
         input: &serde_yaml::Value,
-    ) -> Result<serde_yaml::Value, ToolUseError<<T as Tool>::Error>> {
+    ) -> Result<serde_yaml::Value, ToolUseError> {
         let tool = self
             .tools
             .iter()
             .find(|t| t.matches(name))
             .ok_or(ToolUseError::ToolNotFound)?;
-        tool.invoke(input.clone()).await.map_err(|e| e.into())
+        match tool.invoke(input.clone()).await {
+            Ok(val) => Ok(val),
+            Err(err) => Err(ToolUseError::ToolError(Box::new(err)))
+        }
     }
 
     pub fn get_tool_invocation(
         &self,
         data: &str,
-    ) -> Result<ToolInvocationInput, ToolUseError<<T as Tool>::Error>> {
+    ) -> Result<ToolInvocationInput, ToolUseError> {
         let tool_invocations: Vec<ToolInvocationInput> = find_yaml::<ToolInvocationInput>(data)?;
         if tool_invocations.len() > 1 {
             return Err(ToolUseError::MultipleInvocations);
@@ -78,7 +83,7 @@ where
     pub async fn process_chat_input(
         &self,
         data: &str,
-    ) -> Result<String, ToolUseError<<T as Tool>::Error>> {
+    ) -> Result<String, ToolUseError> {
         let tool_invocation = self.get_tool_invocation(data)?;
         let output = self
             .invoke(&tool_invocation.command, &tool_invocation.input)
@@ -87,13 +92,13 @@ where
     }
 
     /// Generate a YAML-formatted string describing the available tools.
-    pub fn describe(&self) -> Result<String, ToolUseError<<T as Tool>::Error>> {
+    pub fn describe(&self) -> Result<String, ToolUseError> {
         let des: Vec<_> = self.tools.iter().map(|t| t.description()).collect();
         serde_yaml::to_string(&des).map_err(|e| e.into())
     }
 
     /// Generate a prompt template for the tool collection. Combine it with a normal prompt template to perform your task.
-    pub fn to_prompt_template(&self) -> Result<StringTemplate, ToolUseError<<T as Tool>::Error>> {
+    pub fn to_prompt_template(&self) -> Result<StringTemplate, ToolUseError> {
         Ok(StringTemplate::combine(vec![
             StringTemplate::static_string(include_str!("./tool_prompt_prefix.txt").to_string()),
             StringTemplate::static_string(self.describe()?),

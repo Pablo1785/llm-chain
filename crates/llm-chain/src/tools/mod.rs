@@ -32,11 +32,11 @@ mod collection;
 mod description;
 #[cfg(feature = "multitool_default")]
 pub mod multitool_default;
-pub use description::{Describe, Format, FormatPart, ToolDescription};
+pub use description::{Describe, Format, FormatPart, ToolDescription, Tool, State, Yaml, FromContext, Handler, Pipe, PipedFn, HandlerService };
 pub mod multitool;
 mod tool;
 #[allow(clippy::module_inception)]
 pub mod tools;
 
 pub use collection::{ToolCollection, ToolInvocationInput, ToolUseError};
-pub use tool::{Tool, ToolError};
+pub use tool::{ToolError};
