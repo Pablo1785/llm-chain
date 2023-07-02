@@ -55,9 +55,8 @@ struct MyTool {
 }
 
 #[async_trait]
-impl Tool for MyTool {
-    type Error = Infallible;
-    async fn call(&self, message: String) -> Result<String, Self::Error> {
+impl Tool<Infallible> for MyTool {
+    async fn call(&self, message: String) -> Result<String, Box<Infallible>> {
         Ok(format!(
             "Hello from my tool, LLM! You've asked me to {}. I've got {}, {}, and {:?}",
             message, self.id, self.name, self.data
@@ -81,13 +80,13 @@ async fn failable_tool(
     }
 }
 
-async fn my_error_handler(res: Result<String, MyError>) -> MyStruct {
+async fn my_error_handler(res: Result<String, MyError>) -> Result<MyStruct, Infallible> {
     match res {
-        Ok(val) => MyStruct { id: 19, name: val },
-        Err(MyError(err_msg)) => MyStruct {
+        Ok(val) => Ok(MyStruct { id: 19, name: val }),
+        Err(MyError(err_msg)) => Ok(MyStruct {
             id: 0,
             name: format!("Bad luck: {err_msg}"),
-        },
+        }),
     }
 }
 
@@ -102,19 +101,19 @@ async fn vectorstore_tool(
         hnsw_vector_store, ..
     }): State<MyComplicatedState>,
     Yaml(MySimilaritySearchInput { query }): Yaml<MySimilaritySearchInput>,
-) -> MySimilaritySearchOutput {
-    match hnsw_vector_store.similarity_search(query, 1).await {
-        Ok(docs) if docs.len() == 1 => MySimilaritySearchOutput {
-            most_similar_text: docs[0].page_content.clone(),
-            optional_error: None,
-        },
-        Ok(docs) if docs.len() > 1 => MySimilaritySearchOutput { most_similar_text: "".into(), optional_error: Some(MyError("Query executed correctly but more than one document was returned".into())) },
-        Ok(docs) => MySimilaritySearchOutput { most_similar_text: "".into(), optional_error: Some(MyError("Query executed correctly but no documents were found".into())) },
-        Err(err) => MySimilaritySearchOutput {
-            most_similar_text: "".into(),
-            optional_error: Some(MyError(err.to_string())),
-        },
-    }
+) -> Result<MySimilaritySearchOutput, Infallible> {
+    Ok(match hnsw_vector_store.similarity_search(query, 1).await {
+            Ok(docs) if docs.len() == 1 => MySimilaritySearchOutput {
+                most_similar_text: docs[0].page_content.clone(),
+                optional_error: None,
+            },
+            Ok(docs) if docs.len() > 1 => MySimilaritySearchOutput { most_similar_text: "".into(), optional_error: Some(MyError("Query executed correctly but more than one document was returned".into())) },
+            Ok(docs) => MySimilaritySearchOutput { most_similar_text: "".into(), optional_error: Some(MyError("Query executed correctly but no documents were found".into())) },
+            Err(err) => MySimilaritySearchOutput {
+                most_similar_text: "".into(),
+                optional_error: Some(MyError(err.to_string())),
+            },
+        })
 }
 
 #[derive(Clone)]
@@ -194,7 +193,9 @@ pub async fn main() {
         hnsw_vector_store: hnsw_vs,
     };
 
-    let mut handlers: HashMap<String, Box<dyn Tool<Error = ToolUseError>>> = HashMap::new();
+    let mut handlers: HashMap<String, Box<dyn Tool<ToolUseError>>> = HashMap::new();
+
+
 
     handlers.insert("yaml".to_string(), Box::new(print_yaml.pipe(|r| async {
         match r {
@@ -212,14 +213,14 @@ pub async fn main() {
     // );
     // handlers.insert("Other state".to_string(), Box::new(tool_that_uses_different_state.with_state(12.5)));
 
-    let res = handlers.get("pipe").unwrap().call(message.clone()).await;
-    println!("Pipe response: {res:?}");
+    let res = handlers.get("yaml").unwrap().call(message.clone()).await;
+    println!("Yaml response: {res:#?}");
 
-    let res = handlers.get("yaml").unwrap().call(message).await;
-    println!("Yaml response: {res:?}");
+    let res = handlers.get("pipe").unwrap().call(message.clone()).await;
+    println!("Pipe response: {res:#?}");
 
     let res = handlers.get("similarity").unwrap().call("
             query: Some controversial topic
     ".to_string()).await;
-    println!("Similarity response: {res:?}");
+    println!("Similarity response: {res:#?}");
 }
